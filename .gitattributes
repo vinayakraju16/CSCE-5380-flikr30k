@@ -1,0 +1,4 @@
+data/index/faiss.index filter=lfs diff=lfs merge=lfs -text
+data/embeddings/img.npy filter=lfs diff=lfs merge=lfs -text
+data/flickr30k/artifacts/image_clip.npy filter=lfs diff=lfs merge=lfs -text
+data/flickr30k/artifacts/caption_sbert.npy filter=lfs diff=lfs merge=lfs -text

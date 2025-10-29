@@ -22,5 +22,5 @@ timm>=1.0.7
 ultralytics>=8.1.0   # YOLOv8 for object detection
 # BLIP is included via HuggingFace Transformers
 
-# ===== Web App =====
+# ===== Web App ====
 streamlit>=1.33.0

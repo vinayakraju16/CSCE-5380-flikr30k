@@ -1,3 +1,4 @@
+import argparse
 import json
 import pandas as pd
 import numpy as np
@@ -7,14 +8,19 @@ import torch
 from ultralytics import YOLO
 from transformers import BlipForConditionalGeneration, BlipProcessor
 from sklearn.cluster import KMeans
-import csv
 from collections import defaultdict
+from typing import List, Optional
 
 # === Paths ===
 DATA = Path('data/flickr30k')
 IMG_DIR = DATA / 'images'
 CAPS_PATH = DATA / 'captions.json'   # can be JSON or CSV
 OUT = Path('data/features'); OUT.mkdir(parents=True, exist_ok=True)
+
+BLIP_MAX_NEW_TOKENS = 20
+BLIP_BATCH_DEFAULT = 4
+YOLO_CONF_DEFAULT = 0.25
+YOLO_IMGSZ = 640
 
 
 # ============================================================
@@ -82,62 +88,120 @@ def kmeans_colors(im, k=5):
 # ============================================================
 # 🧠 Main Feature Extraction
 # ============================================================
-def main():
+def main(
+    limit: Optional[int] = None,
+    blip_batch: int = BLIP_BATCH_DEFAULT,
+    skip_yolo: bool = False,
+    conf_threshold: float = YOLO_CONF_DEFAULT,
+):
     caps = load_captions(CAPS_PATH)
+
+    image_ids = sorted(caps.keys())
+    if limit is not None:
+        image_ids = image_ids[:limit]
+
+    if not image_ids:
+        print("❌ No images to process. Check your captions or image directory.")
+        return
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"🧠 Using device: {device}")
 
+    if device == 'cuda':
+        torch.backends.cudnn.benchmark = True
+
     # Models
-    yolo = YOLO('yolov8n.pt')  # object detection
-    blip = BlipForConditionalGeneration.from_pretrained('Salesforce/blip-image-captioning-base').to(device).eval()
+    yolo_model = None
+    if not skip_yolo:
+        yolo_model = YOLO('yolov8n.pt')
+        yolo_model.to(device)
+
+    model_dtype = torch.float16 if device == 'cuda' else torch.float32
+    blip = BlipForConditionalGeneration.from_pretrained(
+        'Salesforce/blip-image-captioning-base',
+        torch_dtype=model_dtype
+    ).to(device).eval()
     blip_proc = BlipProcessor.from_pretrained('Salesforce/blip-image-captioning-base')
 
-    rows = []
+    rows: List[dict] = []
+    pending_blip_imgs: List[Image.Image] = []
+    pending_indices: List[int] = []
+    total = len(image_ids)
+    blip_batch = max(1, blip_batch)
 
-    for i, img_id in enumerate(sorted(caps.keys()), 1):
+    def flush_blip_batch():
+        if not pending_blip_imgs:
+            return
+        inputs = blip_proc(images=pending_blip_imgs, return_tensors='pt', padding=True).to(device)
+        if device == 'cuda' and "pixel_values" in inputs:
+            inputs["pixel_values"] = inputs["pixel_values"].half()
+        with torch.no_grad():
+            outputs = blip.generate(**inputs, max_new_tokens=BLIP_MAX_NEW_TOKENS)
+        captions = blip_proc.batch_decode(outputs, skip_special_tokens=True)
+        for row_idx, caption in zip(pending_indices, captions):
+            rows[row_idx]["gen_caption"] = caption
+        pending_blip_imgs.clear()
+        pending_indices.clear()
+
+    for i, img_id in enumerate(image_ids, 1):
         img_path = IMG_DIR / img_id
         if not img_path.exists():
             print(f"[⚠️ Missing image] {img_id}")
             continue
 
         try:
-            im = Image.open(img_path).convert('RGB')
+            pil_img = Image.open(img_path).convert('RGB')
+        except Exception as e:
+            print(f"[❌ Error opening {img_id}] {e}")
+            continue
 
-            # --- YOLOv8 object detection ---
-            y = yolo.predict(source=np.array(im), verbose=False, conf=0.25)[0]
+        try:
+            img_np = np.array(pil_img)
+
             objs = []
-            for b in y.boxes:
-                cls = int(b.cls.tolist()[0])
-                conf = float(b.conf.tolist()[0])
-                xyxy = [float(x) for x in b.xyxy.tolist()[0]]
-                objs.append({"cls": cls, "conf": conf, "box": xyxy})
+            if yolo_model is not None:
+                yolo_out = yolo_model.predict(
+                    source=img_np,
+                    device=device,
+                    verbose=False,
+                    conf=conf_threshold,
+                    imgsz=YOLO_IMGSZ
+                )[0]
+                for b in yolo_out.boxes:
+                    cls = int(b.cls.tolist()[0])
+                    conf = float(b.conf.tolist()[0])
+                    xyxy = [float(x) for x in b.xyxy.tolist()[0]]
+                    objs.append({"cls": cls, "conf": conf, "box": xyxy})
 
-            # --- Dominant color palette ---
-            colors = kmeans_colors(im, k=5)
+            colors = kmeans_colors(pil_img, k=5)
 
-            # --- Generate BLIP caption ---
-            inp = blip_proc(images=im, return_tensors='pt').to(device)
-            with torch.no_grad():
-                out = blip.generate(**inp, max_new_tokens=20)
-            gen_caption = blip_proc.decode(out[0], skip_special_tokens=True)
-
-            # --- Append results ---
-            rows.append({
+            row = {
                 "image_id": img_id,
                 "objects": objs,
                 "colors": colors,
-                "gen_caption": gen_caption,
-                "flickr_captions": caps[img_id]
-            })
+                "gen_caption": "",
+                "flickr_captions": caps.get(img_id, []),
+            }
+            rows.append(row)
 
-            if i % 50 == 0:
-                print(f"✅ Processed {i}/{len(caps)} images")
+            pending_indices.append(len(rows) - 1)
+            pending_blip_imgs.append(pil_img.copy())
+
+            if len(pending_blip_imgs) >= blip_batch:
+                flush_blip_batch()
+
+            if i % 50 == 0 or i == total:
+                print(f"✅ Processed {i}/{total} images")
 
         except Exception as e:
             print(f"[❌ Error on {img_id}] {e}")
 
-    # --- Save output ---
+    flush_blip_batch()
+
+    if not rows:
+        print("⚠️ No rows generated; nothing to save.")
+        return
+
     df = pd.DataFrame(rows)
     if 'image_id' not in df.columns:
         df['image_id'] = [r.get('image_id', None) for r in rows]
@@ -146,7 +210,23 @@ def main():
     df.to_parquet(OUT / 'features.parquet', index=False)
     print("✅ Done! Saved to data/features/features.parquet")
 
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Extract Flickr30k auxiliary features.")
+    parser.add_argument("--limit", type=int, default=None, help="Process at most N images.")
+    parser.add_argument("--skip-yolo", action="store_true", help="Skip YOLO detection for faster runs.")
+    parser.add_argument("--blip-batch", type=int, default=BLIP_BATCH_DEFAULT, help="Batch size for BLIP captioning.")
+    parser.add_argument("--conf", type=float, default=YOLO_CONF_DEFAULT, help="YOLO confidence threshold.")
+    return parser.parse_args()
+
+
 # ============================================================
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(
+        limit=args.limit,
+        blip_batch=args.blip_batch,
+        skip_yolo=args.skip_yolo,
+        conf_threshold=args.conf,
+    )

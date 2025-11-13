@@ -347,16 +347,3 @@ Edit `scripts/03_extract_features.py`:
 
 ---
 
-## 🤝 Contributing
-
-Feel free to submit issues, fork the repository, and create pull requests for any improvements.
-
----
-
-## 📄 License
-
-This project is for educational purposes. Please respect the Flickr30k dataset license and usage terms.
-
----
-
-**Built with ❤️ using Streamlit, CLIP, FAISS, and modern Python ML stack**
